@@ -442,8 +442,194 @@ content-type: application/json
 
 ---
 
+## Part 5: Scaling & Reliability
+
+### Exercise 5.1: Health check (`/health`) vs Readiness check (`/ready`)
+
+Phân tích và chạy thử `05-scaling-reliability/develop/app.py`:
+
+- **`GET /health` (Liveness probe):** Kiểm tra *process còn sống hay không*. Cloud platform / Docker `HEALTHCHECK` dùng endpoint này để phát hiện process bị treo và restart container. Trong `develop/app.py`, `/health` trả `200 OK` kèm `uptime_seconds`, `version`, `timestamp`, và kiểm tra bộ nhớ.
+- **`GET /ready` (Readiness probe):** Kiểm tra *instance đã sẵn sàng nhận traffic chưa*. Load balancer dùng `/ready` để quyết định có định tuyến request tới instance này không: khi mới khởi động (`_is_ready = False`), đang shutdown, hoặc mất kết nối dependency (Redis/DB như trong `production/app.py`), `/ready` phải trả `503 Service Unavailable`.
+
+**Kết quả test thực tế (`05-scaling-reliability/develop/app.py`):**
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"status":"ok","uptime_seconds":0.6,"version":"1.0.0","environment":"development","timestamp":"2026-11-25T08:56:50.530927+00:00","checks":{"memory":{"status":"ok","note":"psutil not installed"}}}
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"ready":true,"in_flight_requests":1}
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
+---
+
+### Exercise 5.2: Graceful shutdown (`SIGTERM`)
+
+**Cơ chế trong `05-scaling-reliability/develop/app.py`:**
+- Middleware `track_requests` đếm `_in_flight_requests` đang xử lý.
+- Đăng ký `signal.signal(signal.SIGTERM, handle_sigterm)` và chạy `uvicorn.run(..., timeout_graceful_shutdown=30)`.
+- Khi nhận `SIGTERM`, `lifespan` chuyển `_is_ready = False` (để load balancer ngừng gửi request mới) và đợi các `_in_flight_requests` hoàn tất trước khi thoát sạch với exit code `0`.
+
+**Kết quả gửi `SIGTERM` thực tế (`kill -TERM 2398`):**
+
+```text
+Process exit code: 0
+```
+
+```text
+INFO:     127.0.0.1:48346 - "POST /ask?question=Hello HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-11-25 15:56:53,782 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 15:56:53,782 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [2398]
+2026-11-25 15:56:53,782 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+---
+
+### Exercise 5.3: Stateless design
+
+- **Vấn đề khi lưu state trong RAM:** Khi scale ngang ra nhiều container/instance (`agent-1`, `agent-2`, `agent-3`), mỗi container có vùng nhớ riêng. Request 1 của user vào `agent-1`, Request 2 qua load balancer sang `agent-2` sẽ bị mất toàn bộ lịch sử hội thoại; ngoài ra restart container cũng làm mất sạch dữ liệu.
+- **Giải pháp trong `05-scaling-reliability/production/app.py`:**
+  - Tách toàn bộ session & conversation history ra **Redis** (`save_session` dùng `_redis.setex(f"session:{session_id}", 3600, json.dumps(data))`, `load_session` đọc từ Redis, `append_to_history` giữ tối đa 20 messages).
+  - Mọi instance đều dùng chung Redis nên bất kỳ instance nào nhận request kế tiếp cũng đọc/ghi cùng một trạng thái phiên.
+
+---
+
+### Exercise 5.4 & 5.5: Load balancing (Nginx + 3 instances) & `test_stateless.py`
+
+Chạy stack trong `05-scaling-reliability/production/` (mở cổng `8080`, endpoint `POST /chat`):
+
+```bash
+touch .env.local
+docker compose -p k5-day14-scaling up -d --build --scale agent=3
+docker compose -p k5-day14-scaling ps
+curl -i http://localhost:8080/health
+python3 test_stateless.py
+docker compose -p k5-day14-scaling down -v
+```
+
+**Trạng thái 5 container (`docker compose ps`):**
+
+```text
+NAME                       IMAGE                    COMMAND                  SERVICE   CREATED          STATUS                       PORTS
+k5-day14-scaling-agent-1   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     13 seconds ago   Up 1 second (health: starting)   8000/tcp
+k5-day14-scaling-agent-2   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     13 seconds ago   Up 1 second (health: starting)   8000/tcp
+k5-day14-scaling-agent-3   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     13 seconds ago   Up 1 second (health: starting)   8000/tcp
+k5-day14-scaling-nginx-1   nginx:alpine             "/docker-entrypoint.…"   nginx     13 seconds ago   Up 1 second                  0.0.0.0:8080->80/tcp
+k5-day14-scaling-redis-1   redis:7-alpine           "docker-entrypoint.s…"   redis     14 seconds ago   Up 12 seconds (healthy)      6379/tcp
+```
+
+**Header `X-Served-By` từ Nginx khi gọi `/health`:**
+
+```http
+HTTP/1.1 200 OK
+Server: nginx/1.31.10
+X-Served-By: 172.20.0.5:8000
+
+{"status":"ok","instance_id":"instance-4902f2","uptime_seconds":0.3,"storage":"redis","redis_connected":true}
+```
+
+**Kết quả chạy `python3 test_stateless.py`:**
+
+```text
+============================================================
+Stateless Scaling Demo
+============================================================
+
+Session ID: 3aa513b2-1125-43ea-806a-c6538c9d72b5
+
+Request 1: [instance-a345ac]
+  Q: What is Docker?
+  A: Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!...
+
+Request 2: [instance-6f875f]
+  Q: Why do we need containers?
+  A: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận....
+
+Request 3: [instance-4902f2]
+  Q: What is Kubernetes?
+  A: Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ O...
+
+Request 4: [instance-a345ac]
+  Q: How does load balancing work?
+  A: Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé....
+
+Request 5: [instance-6f875f]
+  Q: What is Redis used for?
+  A: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận....
+
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-6f875f', 'instance-4902f2', 'instance-a345ac'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  [user]: Why do we need containers?...
+  [assistant]: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã đư...
+  [user]: What is Kubernetes?...
+  [assistant]: Đây là câu trả lời từ AI agent (mock). Trong production, đây...
+  [user]: How does load balancing work?...
+  [assistant]: Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đ...
+  [user]: What is Redis used for?...
+  [assistant]: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã đư...
+
+✅ Session history preserved across all instances via Redis!
+```
+
+**Giải thích kết quả:** Nginx phân phối tuần tự 5 requests trong cùng một `session_id` qua cả 3 container (`instance-a345ac`, `instance-6f875f`, `instance-4902f2`), trong khi `GET /chat/{session_id}/history` vẫn đọc đủ **10 messages** (5 lượt hỏi–đáp) vì toàn bộ lịch sử được lưu tập trung trong Redis.
+
+---
+
+## Part 6: Final Project
+
+Chạy `python check_production_ready.py` đầy đủ trong thư mục `06-lab-complete/` trên Ubuntu WSL2 (có Docker):
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+---
+
 ## AI Log
 
 - **Part 1:** Dùng AI hướng dẫn cài đặt Ubuntu trên WSL2, thiết lập virtual environment `~/day14-venv`, chạy kiểm thử thực tế hai phiên bản `develop` và `production`, và tổng hợp câu trả lời vào `MISSION_ANSWERS.md` dựa trên kết quả chạy trực tiếp trên máy.
 - **Part 2:** Dùng AI hỗ trợ chạy build hai Docker image (`my-agent:develop` và `my-agent:advanced`), khởi chạy và kiểm thử Docker Compose stack qua Nginx, đồng thời kiểm tra lại nội dung giải thích Dockerfile và số đo thực tế từ `docker images` trước khi ghi vào `MISSION_ANSWERS.md`.
 - **Part 4:** Dùng AI hỗ trợ cài `pyjwt`, chạy kiểm thử API Key (`develop`), luồng JWT + vòng lặp gây `429` (`production`) và kiểm tra `GET /me/usage`, đối chiếu code `auth.py`, `rate_limiter.py`, `cost_guard.py` và ghi kết quả (đã che token) vào `MISSION_ANSWERS.md`.
+- **Part 5:** Dùng AI hỗ trợ chạy kiểm thử `/health`, `/ready`, `SIGTERM` graceful shutdown trên bản `develop` và chạy stack 3 instance với Nginx + Redis (`-p k5-day14-scaling`) kèm `test_stateless.py`, sau đó tổng hợp phân tích và kết quả thực tế vào `MISSION_ANSWERS.md`.
+- **Part 6:** Dùng AI hướng dẫn và cùng triển khai các `TODO` trong `06-lab-complete/` (`config.py`, `redis_client.py`, `auth.py`, `rate_limiter.py`, `cost_guard.py`, `main.py`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`), rồi tự kiểm tra lại toàn bộ 12 tiêu chí bằng `check_production_ready.py` trên WSL2 có Docker (`PASS 12/12`, `43/43 checks passed`).
